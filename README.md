@@ -18,4 +18,32 @@ train_model.py：训练ResNet50模型，50轮计算，生成best_model.pth模型
 
 gui.py：用户程序，输入图片，检索出置信度最高的5个汉字。
 ```
+**前置要求**
+
+开始使用前，请确保已安装以下依赖项：
+
+```
+Python 3.11+
+
+PyTorch（建议使用CUDA支持以加速训练）
+
+PyQt5（用于图形界面）
+
+其他Python包：PIL, torchvision, requests, beautifulsoup4, sqlite3
+```
+
+**模型训练**
+
+```
+python train_model.py --data-dir chinese_fonts --epochs 50
+```
+
+**用户程序运行**
+
+若已有预训练模型（best_model.pth）和字符映射（char_map.json），可以立即开始识别字符：
+
+```
+python gui.py
+```
+
 
