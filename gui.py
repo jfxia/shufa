@@ -148,7 +148,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.result_table)
 
         self.status_bar = self.statusBar()
-        self.status_bar.showMessage('准备就绪。请先运行 train_model_opt.py 进行模型训练。')
+        self.status_bar.showMessage('准备就绪。请先运行 train_model.py 进行模型训练。')
 
     def select_img(self):
         path, _ = QFileDialog.getOpenFileName(self, '选择图片', '', '图片 (*.jpg *.jpeg *.png *.gif *.bmp)')
@@ -200,3 +200,4 @@ if __name__ == '__main__':
     if hasattr(win, 'recognizer'):
         win.show()
         sys.exit(app.exec_())
+
