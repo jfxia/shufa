@@ -16,6 +16,6 @@ scraper.py： 爬虫程序，抓取书法字体图片，图片保存在chinese_f
 
 train_model.py：训练ResNet50模型，50轮计算，生成best_model.pth模型文件
 
-gui：用户程序，输入图片，检索出可信度最高的5个汉字
+gui：用户程序，输入图片，检索出置信度最高的5个汉字
 ```
 
