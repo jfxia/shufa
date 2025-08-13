@@ -1,4 +1,4 @@
-# 本程序为train_model.py的分布式训练版本
+# 汉字书法字体识别模型DMTL分布式训练程序
 import os
 import sys
 import json
@@ -8,7 +8,7 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
 from torchvision.models import resnet50, ResNet50_Weights
 from torchvision.transforms import transforms
-from PIL import Image
+import cv2  # 替换PIL为OpenCV加速图片加载
 import argparse
 import numpy as np
 import torch.nn.functional as F
@@ -16,13 +16,47 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import torch.multiprocessing as mp
-import socket
+import logging
+from datetime import datetime
+import random
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# SE注意力模块
+# 设置日志格式
+def setup_logging(rank, output_dir):
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+    logger = logging.getLogger(f"Rank_{rank}")
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter(f'%(asctime)s [Rank {rank}] %(message)s')
+    
+    # 控制台 handler
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
+    
+    # 文件 handler (仅主进程)
+    if rank == 0:
+        file_handler = logging.FileHandler(
+            os.path.join(output_dir, f'train_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log')
+        )
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
+    return logger
+
+# 固定随机种子确保可复现性
+def set_seed(seed, rank):
+    torch.manual_seed(seed + rank)
+    np.random.seed(seed + rank)
+    random.seed(seed + rank)
+    torch.cuda.manual_seed_all(seed + rank)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False  # 关闭自动优化以确保可复现
+
+# SE注意力模块 (支持1D特征)
 class SEBlock(nn.Module):
     def __init__(self, channel, reduction=16):
         super(SEBlock, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)  # 1D池化更高效
         self.fc = nn.Sequential(
             nn.Linear(channel, channel // reduction, bias=False),
             nn.ReLU(inplace=True),
@@ -31,10 +65,10 @@ class SEBlock(nn.Module):
         )
 
     def forward(self, x):
-        b, c, _, _ = x.size()
-        y = self.avg_pool(x).view(b, c)
-        y = self.fc(y).view(b, c, 1, 1)
-        return x * y.expand_as(x)
+        b, c = x.size()  # 直接处理[B, C]形状特征
+        y = self.avg_pool(x.unsqueeze(1)).squeeze(1)  # [B, C] -> [B, 1, C] -> 池化 -> [B, 1, 1] -> [B, 1]
+        y = self.fc(y)  # [B, C]
+        return x * y  # 元素级乘法
 
 # 双任务模型 (DMTL框架)
 class DMTLModel(nn.Module):
@@ -50,12 +84,12 @@ class DMTLModel(nn.Module):
             else:
                 param.requires_grad = False
         
-        # 在stage4后加入SE模块
-        self.se = SEBlock(2048)
-        
         # 获取特征维度
         num_ftrs = self.base_model.fc.in_features
-        self.base_model.fc = nn.Identity()
+        self.base_model.fc = nn.Identity()  # 移除原fc层
+        
+        # 加入SE模块 (处理[B, 2048]特征)
+        self.se = SEBlock(2048)
         
         # 双任务头
         self.char_head = nn.Sequential(
@@ -69,12 +103,11 @@ class DMTLModel(nn.Module):
         
         # 任务不确定性参数
         self.log_vars = nn.Parameter(torch.zeros(2))
-        self.dynamic_weighted_loss = DynamicWeightedLoss()  # 初始化损失权重模块
+        self.dynamic_weighted_loss = DynamicWeightedLoss()
 
     def forward(self, x):
-        features = self.base_model(x)
-        features = self.se(features.unsqueeze(-1).unsqueeze(-1))
-        features = features.squeeze(-1).squeeze(-1)
+        features = self.base_model(x)  # [B, 2048]
+        features = self.se(features)  # 直接处理1D特征，无需维度转换
         char_output = self.char_head(features)
         style_output = self.style_head(features)
         return char_output, style_output
@@ -90,10 +123,10 @@ class DynamicWeightedLoss(nn.Module):
         precision2 = torch.exp(-log_vars[1])
         return precision1 * loss1 + precision2 * loss2 + log_vars.sum()
 
-# 梯度手术 (缓解任务冲突)
+# 梯度手术
 def gradient_surgery(parameters, char_loss, style_loss):
-    char_grads = torch.autograd.grad(char_loss, parameters, retain_graph=True, create_graph=True)
-    style_grads = torch.autograd.grad(style_loss, parameters, retain_graph=True, create_graph=True)
+    char_grads = torch.autograd.grad(char_loss, parameters, retain_graph=True)
+    style_grads = torch.autograd.grad(style_loss, parameters, retain_graph=True)
     
     new_grads = []
     for char_g, style_g in zip(char_grads, style_grads):
@@ -114,56 +147,73 @@ def gradient_surgery(parameters, char_loss, style_loss):
         if grad is not None:
             param.grad = grad
 
-# 数据集类
+# 数据集
 class CalligraphyDataset(Dataset):
     def __init__(self, data_dir, transform=None):
         self.data_dir = data_dir
         self.transform = transform
         self.image_paths = []
         self.char_labels = []
-        self.style_labels = []  # 风格标签
+        self.style_labels = []
         self.char_to_idx = {}
-        self.style_to_idx = {}  # 风格映射
+        self.style_to_idx = {}
         
         supported_exts = ('.jpg', '.jpeg', '.png', '.gif', '.bmp')
         
-        # 遍历数据集
+        # 预过滤损坏图片路径
+        self._load_and_validate_data(supported_exts)
+        
+        # 确保数据集不为空
+        if not self.image_paths:
+            raise ValueError(f"No valid images found in {data_dir}")
+
+    def _load_and_validate_data(self, supported_exts):
         char_idx = 0
         style_idx = 0
-        for style_name in sorted(os.listdir(data_dir)):  # 风格作为一级目录
-            style_dir = os.path.join(data_dir, style_name)
-            if os.path.isdir(style_dir):
-                # 添加风格映射
-                if style_name not in self.style_to_idx:
-                    self.style_to_idx[style_name] = style_idx
-                    style_idx += 1
+        for style_name in sorted(os.listdir(self.data_dir)):
+            style_dir = os.path.join(self.data_dir, style_name)
+            if not os.path.isdir(style_dir):
+                continue
                 
-                for char_name in sorted(os.listdir(style_dir)):
-                    char_dir = os.path.join(style_dir, char_name)
-                    if os.path.isdir(char_dir):
-                        # 添加字符映射
-                        if char_name not in self.char_to_idx:
-                            self.char_to_idx[char_name] = char_idx
-                            char_idx += 1
-                        
-                        # 遍历图片
-                        for file in os.listdir(char_dir):
-                            if file.lower().endswith(supported_exts):
-                                img_path = os.path.join(char_dir, file)
-                                self.image_paths.append(img_path)
-                                self.char_labels.append(self.char_to_idx[char_name])
-                                self.style_labels.append(self.style_to_idx[style_name])
+            if style_name not in self.style_to_idx:
+                self.style_to_idx[style_name] = style_idx
+                style_idx += 1
+            
+            for char_name in sorted(os.listdir(style_dir)):
+                char_dir = os.path.join(style_dir, char_name)
+                if not os.path.isdir(char_dir):
+                    continue
+                    
+                if char_name not in self.char_to_idx:
+                    self.char_to_idx[char_name] = char_idx
+                    char_idx += 1
+                
+                for file in os.listdir(char_dir):
+                    if file.lower().endswith(supported_exts):
+                        img_path = os.path.join(char_dir, file)
+                        # 预验证图片完整性
+                        if self._is_image_valid(img_path):
+                            self.image_paths.append(img_path)
+                            self.char_labels.append(self.char_to_idx[char_name])
+                            self.style_labels.append(self.style_to_idx[style_name])
+
+    def _is_image_valid(self, img_path):
+        try:
+            # 使用OpenCV快速验证图片
+            img = cv2.imread(img_path)
+            return img is not None
+        except:
+            return False
     
     def __len__(self):
         return len(self.image_paths)
     
     def __getitem__(self, idx):
         img_path = self.image_paths[idx]
-        try:
-            image = Image.open(img_path).convert('RGB')
-        except Exception as e:
-            print(f"Warning: Skipping corrupted image {img_path}: {e}")
-            return self.__getitem__((idx + 1) % len(self))
+        # 使用OpenCV加载图片并转换为RGB
+        img = cv2.imread(img_path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # OpenCV默认BGR，转换为RGB
+        image = Image.fromarray(img)  # 转为PIL格式以便应用transforms
         
         char_label = self.char_labels[idx]
         style_label = self.style_labels[idx]
@@ -173,140 +223,154 @@ class CalligraphyDataset(Dataset):
         
         return image, char_label, style_label
 
-def train_one_epoch(model, dataloader, char_criterion, style_criterion, optimizer, device, epoch, rank):
+def train_one_epoch(model, dataloader, char_criterion, style_criterion, optimizer, 
+                   device, epoch, rank, logger, scaler=None):
     model.train()
-    running_char_loss = 0.0
-    running_style_loss = 0.0
-    char_correct = 0
-    style_correct = 0
-    total_samples = 0
+    running_stats = torch.zeros(5, device=device, dtype=torch.float64)  # [char_loss, style_loss, char_correct, style_correct, total]
     
     for i, (inputs, char_labels, style_labels) in enumerate(dataloader):
         inputs, char_labels, style_labels = inputs.to(device), char_labels.to(device), style_labels.to(device)
-        
         optimizer.zero_grad()
         
-        # 前向传播
-        char_outputs, style_outputs = model(inputs)
+        # 混合精度训练上下文
+        with torch.cuda.amp.autocast(enabled=scaler is not None):
+            char_outputs, style_outputs = model(inputs)
+            char_loss = char_criterion(char_outputs, char_labels)
+            style_loss = style_criterion(style_outputs, style_labels)
+            weighted_loss = model.module.dynamic_weighted_loss([char_loss, style_loss], model.module.log_vars)
         
-        # 计算损失
-        char_loss = char_criterion(char_outputs, char_labels)
-        style_loss = style_criterion(style_outputs, style_labels)
-        
-        # 动态加权损失（使用模型的log_vars参数）
-        weighted_loss = model.module.dynamic_weighted_loss([char_loss, style_loss], model.module.log_vars)
-        
-        # 梯度手术 - 使用原始模型参数
+        # 梯度手术
         shared_params = [param for name, param in model.module.named_parameters() 
                          if 'base_model' in name and param.requires_grad]
         gradient_surgery(shared_params, char_loss, style_loss)
         
-        # 反向传播
-        weighted_loss.backward()
-        optimizer.step()
+        # 反向传播 (支持混合精度)
+        if scaler:
+            scaler.scale(weighted_loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            weighted_loss.backward()
+            optimizer.step()
         
         # 更新统计信息
-        running_char_loss += char_loss.item() * inputs.size(0)
-        running_style_loss += style_loss.item() * inputs.size(0)
+        batch_size = inputs.size(0)
         _, char_preds = torch.max(char_outputs, 1)
         _, style_preds = torch.max(style_outputs, 1)
-        char_correct += torch.sum(char_preds == char_labels.data)
-        style_correct += torch.sum(style_preds == style_labels.data)
-        total_samples += inputs.size(0)
         
-        # 仅主进程打印批次日志
+        running_stats[0] += char_loss.item() * batch_size
+        running_stats[1] += style_loss.item() * batch_size
+        running_stats[2] += torch.sum(char_preds == char_labels.data).double()
+        running_stats[3] += torch.sum(style_preds == style_labels.data).double()
+        running_stats[4] += batch_size
+        
+        # 打印批次日志
         if rank == 0 and i % 50 == 49:
-            print(f"Epoch {epoch} Batch {i+1}: Char Loss: {char_loss.item():.4f}, "
-                  f"Style Loss: {style_loss.item():.4f}, "
-                  f"Char Acc: {char_correct.double() / total_samples:.4f}, "
-                  f"Style Acc: {style_correct.double() / total_samples:.4f}")
+            batch_char_acc = running_stats[2] / running_stats[4]
+            batch_style_acc = running_stats[3] / running_stats[4]
+            logger.info(f"Epoch {epoch} Batch {i+1}: "
+                        f"Char Loss: {char_loss.item():.4f}, Style Loss: {style_loss.item():.4f}, "
+                        f"Char Acc: {batch_char_acc:.4f}, Style Acc: {batch_style_acc:.4f}")
     
-    # 准备聚合的张量
-    total_samples_tensor = torch.tensor(total_samples, device=device, dtype=torch.float64)
-    running_char_loss_tensor = torch.tensor(running_char_loss, device=device, dtype=torch.float64)
-    running_style_loss_tensor = torch.tensor(running_style_loss, device=device, dtype=torch.float64)
-    char_correct_tensor = char_correct.double().to(device)
-    style_correct_tensor = style_correct.double().to(device)
-    
-    # 聚合所有进程的数据
-    dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(running_char_loss_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(running_style_loss_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(char_correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(style_correct_tensor, op=dist.ReduceOp.SUM)
-    
-    epoch_char_loss = running_char_loss_tensor.item() / total_samples_tensor.item()
-    epoch_style_loss = running_style_loss_tensor.item() / total_samples_tensor.item()
-    epoch_char_acc = char_correct_tensor.item() / total_samples_tensor.item()
-    epoch_style_acc = style_correct_tensor.item() / total_samples_tensor.item()
-    
-    return epoch_char_loss, epoch_style_loss, epoch_char_acc, epoch_style_acc
+    # 合并所有进程的统计信息 (单步all_reduce优化)
+    dist.all_reduce(running_stats, op=dist.ReduceOp.SUM)
+    total = running_stats[4].item()
+    return (
+        running_stats[0].item() / total,
+        running_stats[1].item() / total,
+        running_stats[2].item() / total,
+        running_stats[3].item() / total
+    )
 
 def evaluate(model, dataloader, char_criterion, style_criterion, device):
     model.eval()
-    running_char_loss = 0.0
-    running_style_loss = 0.0
-    char_correct = 0
-    style_correct = 0
-    total_samples = 0
+    running_stats = torch.zeros(5, device=device, dtype=torch.float64)  # [char_loss, style_loss, char_correct, style_correct, total]
     
-    with torch.no_grad():
+    with torch.inference_mode():  # 更高效的推理模式
         for inputs, char_labels, style_labels in dataloader:
             inputs, char_labels, style_labels = inputs.to(device), char_labels.to(device), style_labels.to(device)
-            
             char_outputs, style_outputs = model(inputs)
             
             char_loss = char_criterion(char_outputs, char_labels)
             style_loss = style_criterion(style_outputs, style_labels)
             
-            running_char_loss += char_loss.item() * inputs.size(0)
-            running_style_loss += style_loss.item() * inputs.size(0)
+            batch_size = inputs.size(0)
             _, char_preds = torch.max(char_outputs, 1)
             _, style_preds = torch.max(style_outputs, 1)
-            char_correct += torch.sum(char_preds == char_labels.data)
-            style_correct += torch.sum(style_preds == style_labels.data)
-            total_samples += inputs.size(0)
+            
+            running_stats[0] += char_loss.item() * batch_size
+            running_stats[1] += style_loss.item() * batch_size
+            running_stats[2] += torch.sum(char_preds == char_labels.data).double()
+            running_stats[3] += torch.sum(style_preds == style_labels.data).double()
+            running_stats[4] += batch_size
     
-    # 准备聚合的张量
-    total_samples_tensor = torch.tensor(total_samples, device=device, dtype=torch.float64)
-    running_char_loss_tensor = torch.tensor(running_char_loss, device=device, dtype=torch.float64)
-    running_style_loss_tensor = torch.tensor(running_style_loss, device=device, dtype=torch.float64)
-    char_correct_tensor = char_correct.double().to(device)
-    style_correct_tensor = style_correct.double().to(device)
-    
-    # 聚合所有进程的数据
-    dist.all_reduce(total_samples_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(running_char_loss_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(running_style_loss_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(char_correct_tensor, op=dist.ReduceOp.SUM)
-    dist.all_reduce(style_correct_tensor, op=dist.ReduceOp.SUM)
-    
-    epoch_char_loss = running_char_loss_tensor.item() / total_samples_tensor.item()
-    epoch_style_loss = running_style_loss_tensor.item() / total_samples_tensor.item()
-    epoch_char_acc = char_correct_tensor.item() / total_samples_tensor.item()
-    epoch_style_acc = style_correct_tensor.item() / total_samples_tensor.item()
-    
-    return epoch_char_loss, epoch_style_loss, epoch_char_acc, epoch_style_acc
+    # 合并所有进程的统计信息
+    dist.all_reduce(running_stats, op=dist.ReduceOp.SUM)
+    total = running_stats[4].item()
+    return (
+        running_stats[0].item() / total,
+        running_stats[1].item() / total,
+        running_stats[2].item() / total,
+        running_stats[3].item() / total
+    )
 
 def init_distributed(rank, world_size, args):
-    """初始化分布式环境"""
+    """初始化分布式环境 (从环境变量获取参数)"""
     os.environ['MASTER_ADDR'] = args.master_addr
     os.environ['MASTER_PORT'] = args.master_port
-    
-    # 初始化进程组
     dist.init_process_group(
-        backend='nccl',  # GPU使用nccl通信
+        backend='nccl',
         rank=rank,
         world_size=world_size
     )
-    
-    # 设置当前设备
     torch.cuda.set_device(rank % torch.cuda.device_count())
+
+def save_checkpoint(model, optimizer, scheduler, epoch, best_char_acc, output_dir, logger):
+    """保存训练检查点"""
+    checkpoint = {
+        'model_state_dict': model.module.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
+        'epoch': epoch,
+        'best_char_acc': best_char_acc
+    }
+    # 保存最新检查点
+    latest_path = os.path.join(output_dir, 'latest_checkpoint.pth')
+    torch.save(checkpoint, latest_path)
+    logger.info(f"Saved latest checkpoint to {latest_path}")
+    
+    # 保存最佳检查点
+    best_path = os.path.join(output_dir, 'best_model.pth')
+    torch.save(model.module.state_dict(), best_path)
+    logger.info(f"Saved best model to {best_path}")
+
+def load_checkpoint(model, optimizer, scheduler, resume_path, device, logger):
+    """加载检查点恢复训练"""
+    if not os.path.exists(resume_path):
+        logger.error(f"Checkpoint {resume_path} not found!")
+        return 0, 0.0
+    
+    checkpoint = torch.load(resume_path, map_location=device)
+    model.module.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    if scheduler and checkpoint['scheduler_state_dict']:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+    
+    start_epoch = checkpoint['epoch'] + 1  # 从下一个epoch开始
+    best_char_acc = checkpoint['best_char_acc']
+    logger.info(f"Resumed from checkpoint: epoch {checkpoint['epoch']}, best char acc {best_char_acc:.4f}")
+    return start_epoch, best_char_acc
 
 def train(rank, world_size, args):
     # 初始化分布式环境
     init_distributed(rank, world_size, args)
     device = torch.device(f'cuda:{rank % torch.cuda.device_count()}')
+    
+    # 初始化日志
+    logger = setup_logging(rank, args.output_dir)
+    
+    # 固定随机种子
+    set_seed(args.seed, rank)
     
     # 数据增强
     data_transforms = {
@@ -327,16 +391,22 @@ def train(rank, world_size, args):
     }
     
     # 加载数据集
-    full_dataset = CalligraphyDataset(args.data_dir, transform=data_transforms['train'])
+    try:
+        full_dataset = CalligraphyDataset(args.data_dir, transform=data_transforms['train'])
+    except ValueError as e:
+        logger.error(e)
+        dist.destroy_process_group()
+        return
+    
     num_chars = len(full_dataset.char_to_idx)
     num_styles = len(full_dataset.style_to_idx)
     
-    # 仅在主进程保存映射表
+    # 仅主进程保存映射表
     if rank == 0:
-        print(f"Found {len(full_dataset)} images, {num_chars} characters, {num_styles} styles")
-        with open('char_map.json', 'w', encoding='utf-8') as f:
+        logger.info(f"Found {len(full_dataset)} images, {num_chars} characters, {num_styles} styles")
+        with open(os.path.join(args.output_dir, 'char_map.json'), 'w', encoding='utf-8') as f:
             json.dump(full_dataset.char_to_idx, f, ensure_ascii=False, indent=4)
-        with open('style_map.json', 'w', encoding='utf-8') as f:
+        with open(os.path.join(args.output_dir, 'style_map.json'), 'w', encoding='utf-8') as f:
             json.dump(full_dataset.style_to_idx, f, ensure_ascii=False, indent=4)
     
     # 划分训练集和验证集
@@ -345,35 +415,34 @@ def train(rank, world_size, args):
     train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
     val_dataset.dataset.transform = data_transforms['val']
     
-    # 使用DistributedSampler进行数据分片
+    # 数据加载器
     train_sampler = DistributedSampler(train_dataset, shuffle=True)
     val_sampler = DistributedSampler(val_dataset, shuffle=False)
     
-    # 数据加载器
     train_loader = DataLoader(
         train_dataset, 
         batch_size=args.batch_size, 
         sampler=train_sampler,
-        num_workers=4,
-        pin_memory=True
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True  # 丢弃最后一个不完整批次
     )
     val_loader = DataLoader(
         val_dataset, 
         batch_size=args.batch_size, 
         sampler=val_sampler,
-        num_workers=4,
+        num_workers=args.num_workers,
         pin_memory=True
     )
     
-    # 初始化模型并包装为DDP
+    # 初始化模型
     model = DMTLModel(num_chars, num_styles).to(device)
     model = DDP(model, device_ids=[device], find_unused_parameters=True)
     
-    # 损失函数
+    # 损失函数和优化器
     char_criterion = nn.CrossEntropyLoss()
     style_criterion = nn.CrossEntropyLoss()
     
-    # 学习率根据总GPU数量缩放
     scaled_lr = args.lr * world_size
     optimizer = optim.AdamW([
         {'params': model.module.base_model.parameters(), 'lr': scaled_lr * 0.1},
@@ -382,63 +451,102 @@ def train(rank, world_size, args):
         {'params': model.module.log_vars}
     ], lr=scaled_lr, weight_decay=1e-5)
     
+    # 学习率调度器
+    scheduler = CosineAnnealingLR(optimizer, T_max=args.epochs)
+    
+    # 混合精度训练
+    scaler = torch.cuda.amp.GradScaler() if args.mixed_precision else None
+    
+    # 断点续训
+    start_epoch = 0
     best_char_acc = 0.0
+    if args.resume:
+        start_epoch, best_char_acc = load_checkpoint(
+            model, optimizer, scheduler, args.resume, device, logger
+        )
     
     # 训练循环
-    for epoch in range(args.epochs):
-        # 设置sampler的epoch，确保每个epoch数据打乱方式一致
+    for epoch in range(start_epoch, args.epochs):
         train_sampler.set_epoch(epoch)
         val_sampler.set_epoch(epoch)
         
         if rank == 0:
-            print(f"\nEpoch {epoch+1}/{args.epochs}")
-            print('-' * 10)
+            logger.info(f"\nEpoch {epoch+1}/{args.epochs}")
+            logger.info('-' * 40)
         
-        # 训练一个epoch
-        train_char_loss, train_style_loss, train_char_acc, train_style_acc = train_one_epoch(
-            model, train_loader, char_criterion, style_criterion, optimizer, device, epoch+1, rank
+        # 训练
+        train_metrics = train_one_epoch(
+            model, train_loader, char_criterion, style_criterion, optimizer, 
+            device, epoch+1, rank, logger, scaler
         )
+        train_char_loss, train_style_loss, train_char_acc, train_style_acc = train_metrics
         
         # 验证
-        val_char_loss, val_style_loss, val_char_acc, val_style_acc = evaluate(
+        val_metrics = evaluate(
             model, val_loader, char_criterion, style_criterion, device
         )
+        val_char_loss, val_style_loss, val_char_acc, val_style_acc = val_metrics
         
-        # 仅主节点打印日志和保存模型
+        # 学习率调度
+        scheduler.step()
+        
+        # 主进程日志和保存
         if rank == 0:
-            print(f"Train Char: Loss {train_char_loss:.4f} Acc {train_char_acc:.4f}")
-            print(f"Train Style: Loss {train_style_loss:.4f} Acc {train_style_acc:.4f}")
-            print(f"Val Char: Loss {val_char_loss:.4f} Acc {val_char_acc:.4f}")
-            print(f"Val Style: Loss {val_style_loss:.4f} Acc {val_style_acc:.4f}")
+            logger.info(f"Train: Char Loss {train_char_loss:.4f} Acc {train_char_acc:.4f}; "
+                        f"Style Loss {train_style_loss:.4f} Acc {train_style_acc:.4f}")
+            logger.info(f"Val:   Char Loss {val_char_loss:.4f} Acc {val_char_acc:.4f}; "
+                        f"Style Loss {val_style_loss:.4f} Acc {val_style_acc:.4f}")
+            logger.info(f"Current LR: {optimizer.param_groups[0]['lr']:.6f}")
             
+            # 保存检查点
             if val_char_acc > best_char_acc:
                 best_char_acc = val_char_acc
-                torch.save(model.module.state_dict(), 'best_model.pth')
-                print("Saved best model")
+                logger.info(f"New best char accuracy: {best_char_acc:.4f}")
+            
+            # 每5个epoch或最后一个epoch保存检查点
+            if (epoch + 1) % 5 == 0 or (epoch + 1) == args.epochs:
+                save_checkpoint(model, optimizer, scheduler, epoch, best_char_acc, args.output_dir, logger)
     
-    # 清理分布式环境
+    # 清理
     dist.destroy_process_group()
 
 def main():
-    parser = argparse.ArgumentParser(description='Distributed DMTL calligraphy recognition model')
-    parser.add_argument('--data-dir', type=str, required=True, help='Path to chinese_fonts dataset (must be accessible by all nodes)')
-    parser.add_argument('--epochs', type=int, default=50, help='Training epochs')
+    parser = argparse.ArgumentParser(description='Distributed DMTL Calligraphy Recognition')
+    # 数据与训练参数
+    parser.add_argument('--data-dir', type=str, required=True, help='Path to dataset (shared across nodes)')
+    parser.add_argument('--epochs', type=int, default=50, help='Total training epochs')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size per GPU')
-    parser.add_argument('--lr', type=float, default=0.0005, help='Base learning rate (will be scaled by number of GPUs)')
-    parser.add_argument('--world-size', type=int, default=16, help='Total number of GPUs (4 servers × 4 GPUs)')
-    parser.add_argument('--rank', type=int, default=0, help='Rank of current process (auto-set by launcher)')
-    parser.add_argument('--master-addr', type=str, default='127.0.0.1', help='Master node IP address')
-    parser.add_argument('--master-port', type=str, default='23456', help='Master node port number')
+    parser.add_argument('--lr', type=float, default=0.0005, help='Base learning rate (scaled by world size)')
+    parser.add_argument('--num-workers', type=int, default=4, help='Number of data loading workers per process')
+    
+    # 分布式参数
+    parser.add_argument('--world-size', type=int, required=True, help='Total number of GPUs across all nodes')
+    parser.add_argument('--master-addr', type=str, default='127.0.0.1', help='Master node IP')
+    parser.add_argument('--master-port', type=str, default='23456', help='Master node port')
+    
+    # 优化相关参数
+    parser.add_argument('--seed', type=int, default=42, help='Random seed for reproducibility')
+    parser.add_argument('--mixed-precision', action='store_true', help='Enable mixed precision training')
+    parser.add_argument('--output-dir', type=str, default='outputs', help='Directory to save logs and checkpoints')
+    parser.add_argument('--resume', type=str, default='', help='Path to checkpoint for resume training')
+    
     args = parser.parse_args()
     
-    # 启动分布式训练
-    if args.rank == 0:
+    # 从环境变量获取rank (兼容torch.distributed.launch)
+    local_rank = int(os.environ.get('LOCAL_RANK', 0))
+    if local_rank == 0:
         print(f"Starting distributed training with {args.world_size} GPUs")
-    mp.spawn(train, args=(args.world_size, args), nprocs=args.world_size, join=True)
+        print(f"Outputs will be saved to {args.output_dir}")
+    
+    # 启动分布式训练
+    mp.spawn(
+        train, 
+        args=(args.world_size, args), 
+        nprocs=args.world_size, 
+        join=True
+    )
 
 if __name__ == '__main__':
-    # 确保CUDA可见性（如果需要指定GPU）
-    # os.environ["CUDA_VISIBLE_DEVICES"] = "0,1,2,3"  # 每台服务器上的GPU编号
     main()
 
 '''
@@ -457,22 +565,34 @@ if __name__ == '__main__':
 
 **主节点**
 ```
-python -m torch.distributed.launch --nproc_per_node=4 --nnodes=4 --node_rank=0 --master_addr="192.168.1.101" --master_port=23456 train_model.py --data-dir=/path/to/chinese_fonts_dataset --epochs=50 --batch-size=32
+python -m torch.distributed.launch --nproc_per_node=4 --nnodes=4 --node_rank=0 \
+  --master_addr="192.168.1.101" --master_port=23456 train_model_ddp.py \
+  --data-dir=/path/to/dataset --world-size=16 --epochs=100 \
+  --batch-size=32 --num-workers=8 --mixed-precision --output-dir=./training_results
 ```
 
 **从节点1**
 ```
-python -m torch.distributed.launch --nproc_per_node=4 --nnodes=4 --node_rank=1 --master_addr="192.168.1.101" --master_port=23456 train_model.py --data-dir=/path/to/chinese_fonts_dataset --epochs=50 --batch-size=32
+python -m torch.distributed.launch --nproc_per_node=4 --nnodes=4 --node_rank=1 \
+  --master_addr="192.168.1.101" --master_port=23456 train_model_ddp.py \
+  --data-dir=/path/to/dataset --world-size=16 --epochs=100 \
+  --batch-size=32 --num-workers=8 --mixed-precision --output-dir=./training_results
 ```
 
 **从节点2**
 ```
-python -m torch.distributed.launch --nproc_per_node=4 --nnodes=4 --node_rank=2 --master_addr="192.168.1.101" --master_port=23456 train_model.py --data-dir=/path/to/chinese_fonts_dataset --epochs=50 --batch-size=32
+python -m torch.distributed.launch --nproc_per_node=4 --nnodes=4 --node_rank=2 \
+  --master_addr="192.168.1.101" --master_port=23456 train_model_ddp.py \
+  --data-dir=/path/to/dataset --world-size=16 --epochs=100 \
+  --batch-size=32 --num-workers=8 --mixed-precision --output-dir=./training_results
 ```
 
 **从节点3**
 ```
-python -m torch.distributed.launch --nproc_per_node=4 --nnodes=4 --node_rank=3 --master_addr="192.168.1.101" --master_port=23456 train_model.py --data-dir=/path/to/chinese_fonts_dataset --epochs=50 --batch-size=32
+python -m torch.distributed.launch --nproc_per_node=4 --nnodes=4 --node_rank=3 \
+  --master_addr="192.168.1.101" --master_port=23456 train_model_ddp.py \
+  --data-dir=/path/to/dataset --world-size=16 --epochs=100 \
+  --batch-size=32 --num-workers=8 --mixed-precision --output-dir=./training_results
 ```
 
 **注意事项**
@@ -487,6 +607,5 @@ python -m torch.distributed.launch --nproc_per_node=4 --nnodes=4 --node_rank=3 -
 
 (5)训练过程中只有主节点会打印日志和保存模型，其他节点仅进行计算
 
+(6)如需从断点恢复训练，添加--resume=./training_results/latest_checkpoint.pth参数即可。
 '''
-
-
