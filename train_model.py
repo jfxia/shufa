@@ -68,13 +68,42 @@ def get_model(num_classes):
     )
     return model
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device):
+def save_checkpoint(state, filename='checkpoint.pth'):
+    """保存训练断点"""
+    torch.save(state, filename)
+    print(f"Checkpoint saved to {filename}")
+
+def load_checkpoint(checkpoint_path, model, optimizer):
+    """加载训练断点"""
+    if os.path.isfile(checkpoint_path):
+        print(f"Loading checkpoint from {checkpoint_path}")
+        checkpoint = torch.load(checkpoint_path)
+        
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+        start_epoch = checkpoint['epoch']
+        best_acc = checkpoint['best_acc']
+        loss = checkpoint['loss']
+        
+        print(f"Resuming training from epoch {start_epoch + 1}, best accuracy: {best_acc:.4f}")
+        return start_epoch, best_acc, loss
+    else:
+        print(f"No checkpoint found at {checkpoint_path}, starting training from scratch.")
+        return 0, 0.0, float('inf')
+
+def train_one_epoch(model, dataloader, criterion, optimizer, device, start_batch_idx=0):
+    """修改后的train_one_epoch，支持从指定batch开始"""
     model.train()
     running_loss = 0.0
     correct_predictions = 0
     total_samples = 0
-
+    
+    # 跳过前面的批次
     for i, (inputs, labels) in enumerate(dataloader):
+        if i < start_batch_idx:
+            continue
+            
         inputs, labels = inputs.to(device), labels.to(device)
         optimizer.zero_grad()
         outputs = model(inputs)
@@ -90,8 +119,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
         if i % 50 == 49:
             print(f"  Batch {i+1}/{len(dataloader)}, Loss: {loss.item():.4f}")
 
-    epoch_loss = running_loss / total_samples
-    epoch_acc = correct_predictions.double() / total_samples
+    epoch_loss = running_loss / total_samples if total_samples > 0 else 0.0
+    epoch_acc = correct_predictions.double() / total_samples if total_samples > 0 else 0.0
     return epoch_loss, epoch_acc
 
 def evaluate(model, dataloader, criterion, device):
@@ -120,6 +149,8 @@ def main():
     parser.add_argument('--epochs', type=int, default=50, help='Number of training epochs.')
     parser.add_argument('--batch-size', type=int, default=32, help='Batch size for training.')
     parser.add_argument('--lr', type=float, default=0.0005, help='Learning rate.')
+    parser.add_argument('--resume', type=str, default='', help='Path to checkpoint to resume from')
+    parser.add_argument('--checkpoint-freq', type=int, default=5, help='Save checkpoint every N epochs')
     args = parser.parse_args()
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -150,9 +181,13 @@ def main():
     num_classes = len(full_dataset.char_to_idx)
     print(f"Found {len(full_dataset)} images belonging to {num_classes} classes.")
 
-    with open('char_map.json', 'w', encoding='utf-8') as f:
-        json.dump(full_dataset.char_to_idx, f, ensure_ascii=False, indent=4)
-    print("Character map saved to char_map.json")
+    # 检查字符映射文件是否存在，如果不存在则创建
+    if not os.path.exists('char_map.json'):
+        with open('char_map.json', 'w', encoding='utf-8') as f:
+            json.dump(full_dataset.char_to_idx, f, ensure_ascii=False, indent=4)
+        print("Character map saved to char_map.json")
+    else:
+        print("Character map already exists, skipping creation.")
 
     train_size = int(0.8 * len(full_dataset))
     val_size = len(full_dataset) - train_size
@@ -169,19 +204,50 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr)
 
+    # 断点续训相关变量
+    start_epoch = 0
     best_acc = 0.0
-    for epoch in range(args.epochs):
+    
+    # 如果指定了断点文件，则加载
+    if args.resume:
+        start_epoch, best_acc, _ = load_checkpoint(args.resume, model, optimizer)
+    
+    # 训练循环
+    for epoch in range(start_epoch, args.epochs):
         print(f"\nEpoch {epoch+1}/{args.epochs}")
         print('-' * 10)
+        
         train_loss, train_acc = train_one_epoch(model, dataloaders['train'], criterion, optimizer, device)
         print(f"Train Loss: {train_loss:.4f} Acc: {train_acc:.4f}")
+        
         val_loss, val_acc = evaluate(model, dataloaders['val'], criterion, device)
         print(f"Val Loss: {val_loss:.4f} Acc: {val_acc:.4f}")
 
+        # 保存最佳模型
         if val_acc > best_acc:
             best_acc = val_acc
             torch.save(model.state_dict(), 'best_model.pth')
             print("Best model saved to best_model.pth")
+        
+        # 定期保存断点
+        if (epoch + 1) % args.checkpoint_freq == 0:
+            checkpoint_path = f'checkpoint_epoch_{epoch+1}.pth'
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'best_acc': best_acc,
+                'loss': val_loss,
+            }, checkpoint_path)
+            
+        # 始终保存最新的断点
+        save_checkpoint({
+            'epoch': epoch + 1,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'best_acc': best_acc,
+            'loss': val_loss,
+        }, 'latest_checkpoint.pth')
 
     print(f"\nTraining complete. Best validation accuracy: {best_acc:.4f}")
 

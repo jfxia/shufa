@@ -200,4 +200,3 @@ if __name__ == '__main__':
     if hasattr(win, 'recognizer'):
         win.show()
         sys.exit(app.exec_())
-
