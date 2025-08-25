@@ -16,6 +16,8 @@ https://huggingface.co/xiajingfeng/chinese-calligraphy-recognition-v1
 ```
 scraper.py： 爬虫程序，抓取书法字体图片，图片保存在chinese_fonts目录，汉字信息保存在SQLite数据库文件font_database.db。
 
+clean.py：图片清理程序，找出矢量图、动态gif、小尺寸图片(<50px)，可以将这些图片删除。
+
 train_model.py：训练ResNet50模型，50轮计算，生成best_model.pth模型文件。
 
 gui.py：用户程序，输入图片，检索出置信度最高的5个汉字。
