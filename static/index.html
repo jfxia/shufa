@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8"/>
+    <title>汉字书法字体识别</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no"/>
+    <meta name="apple-mobile-web-app-capable" content="yes"/>
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+    <style>
+        *{box-sizing:border-box;margin:0;padding:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,"PingFang SC",sans-serif}
+        body{background:#f5f5f5;display:flex;flex-direction:column;align-items:center;padding:20px;color:#333}
+        h1{margin-bottom:20px;font-size:24px;font-weight:600}
+        #preview{max-width:100%;max-height:50vh;border-radius:8px;object-fit:contain;background:#fff;border:1px solid #ddd;margin-bottom:16px}
+        input[type=file]{display:none}
+        label[for=file]{background:#0078d4;color:#fff;padding:12px 32px;border-radius:30px;font-size:16px;cursor:pointer;box-shadow:0 2px 6px rgba(0,0,0,.2);margin-bottom:20px}
+        label[for=file]:active{background:#005a9e}
+        #loading{margin:16px 0;display:none;font-size:14px;color:#0078d4}
+        table{width:100%;max-width:400px;border-collapse:collapse;background:#fff;border-radius:8px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.1)}
+        th,td{padding:12px;text-align:center}
+        th{background:#e0e0e0;font-weight:600}
+        tr:nth-child(even){background:#fafafa}
+        .err{color:#e53935;font-size:14px;margin-top:10px}
+		footer{margin-top:30px;font-size:12px;color:#666;text-align:center}
+    </style>
+</head>
+
+<body>
+    <h1>汉字书法字体识别</h1>
+
+    <img id="preview" alt="点击选择图片" src="han.png" width="200" height="300"/>
+
+    <input id="file" type="file" accept="image/*"/>
+    <label for="file">选择图片</label>
+
+    <div id="loading">识别中，请稍候…</div>
+
+    <table id="result" style="display:none;">
+        <thead>
+            <tr><th>识别结果</th><th>置信度</th></tr>
+        </thead>
+        <tbody></tbody>
+    </table>
+
+    <div id="error" class="err"></div>
+	<footer>&gt;&gt;&nbsp;<a href="https://github.com/jfxia/shufa" target="_blank">github.com/jfxia/shufa</a>&nbsp;&lt;&lt;</footer> 
+
+<script>
+document.getElementById('file').addEventListener('change', e => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    // 预览
+    const img = document.getElementById('preview');
+    img.src = URL.createObjectURL(file);
+
+    document.getElementById('result').style.display = 'none';
+    document.getElementById('error').textContent = '';
+    document.getElementById('loading').style.display = 'block';
+
+    const form = new FormData();
+    form.append('file', file);
+
+    fetch('/upload', {method:'POST', body:form})
+        .then(r => {
+            if(!r.ok) throw new Error('识别失败：' + r.status);
+            return r.json();
+        })
+        .then(renderResult)
+        .catch(err => {
+            document.getElementById('error').textContent = err.message || '未知错误';
+            document.getElementById('loading').style.display = 'none';
+        });
+});
+
+function renderResult(list){
+    const tbody = document.querySelector('#result tbody');
+    tbody.innerHTML = '';
+    list.forEach(item=>{
+        const tr=document.createElement('tr');
+        tr.innerHTML=`<td>${item.char}</td><td>${item.prob}</td>`;
+        tbody.appendChild(tr);
+    });
+    document.getElementById('result').style.display='table';
+    document.getElementById('loading').style.display='none';
+}
+</script>
+</body>
+</html>
