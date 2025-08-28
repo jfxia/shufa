@@ -51,14 +51,20 @@ python gui.py
 ```
 
 
-## Web访问
+## 本地Web服务部署
 
-**程序文件**
+**文件清单**
 
 ```
-main.py：基于FastAPI的后端程序
+main.py：基于FastAPI的web后端程序
 
-static/index.html：用户前端页面
+static/index.html：用户前端页面，可在手机浏览器访问
+
+static/han.png:预览图
+
+char_map.json：汉字映射表
+
+best_model.pth：汉字书法字体模型文件
 ```
 
 **启动Web服务**
@@ -69,8 +75,6 @@ static/index.html：用户前端页面
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-从而在浏览器中访问127.0.0.1:8000
-
-或者可以访问部署在HuggingFace的web服务 https://huggingface.co/spaces/xiajingfeng/shufa
+从而在浏览器中访问127.0.0.1:8000。用户也可以在公有云平台部署上述web服务，或者体验部署在HuggingFace的web服务 https://huggingface.co/spaces/xiajingfeng/shufa
 
 ![screenshot](/assets/screenshot2.png)
