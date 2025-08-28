@@ -34,12 +34,13 @@ gui.py：用户程序，输入图片，检索出置信度最高的5个汉字。
 
 ```
 Python 3.11+
-
 PyTorch（建议使用CUDA支持以加速训练）
-
-PyQt5（用于图形界面）
-
-其他Python包：PIL, torchvision, requests, beautifulsoup4, sqlite3
+PyQt5
+PIL
+torchvision
+requests
+beautifulsoup4
+sqlite3
 ```
 
 **模型训练**
