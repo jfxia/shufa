@@ -51,3 +51,26 @@ python gui.py
 ```
 
 
+## Web访问
+
+**程序文件**
+
+```
+main.py：基于FastAPI的后端程序
+
+static/index.html：用户前端页面
+```
+
+**启动Web服务**
+
+请安装uvicorn，而后执行如下命令：
+
+```
+uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+从而在浏览器中访问127.0.0.1:8000
+
+或者可以访问部署在HuggingFace的web服务 https://huggingface.co/spaces/xiajingfeng/shufa
+
+![screenshot](/assets/screenshot2.png)
