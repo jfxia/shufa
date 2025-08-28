@@ -12,6 +12,12 @@
 
 https://huggingface.co/xiajingfeng/chinese-calligraphy-recognition-v1
 
+部分测试图片：
+
+![test](/assets/test.png)
+
+目前此模型只能识别单个汉字，因此拍照时若包含多个汉字，需要把语识别的字切分出来。汉字书法，特别是草书多有连笔（以草圣张旭为代表），难以切分辨认，这就比较考验用户的眼力了。
+
 **程序文件**：
 ```
 scraper.py： 爬虫程序，抓取书法字体图片，图片保存在chinese_fonts目录，汉字信息保存在SQLite数据库文件font_database.db。
