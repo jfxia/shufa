@@ -49,9 +49,11 @@ sqlite3
 python train_model.py --data-dir chinese_fonts --epochs 50
 ```
 
+在一颗英伟达RTX4070上训练此模型，耗时约9个小时，每5轮生成一个checkpoint文件。
+
 **用户程序运行**
 
-若已有预训练模型（best_model.pth）和字符映射（char_map.json），可以立即开始识别字符：
+若已有预训练模型（best_model.pth）和字符映射（char_map.json），可以立即开始识别汉字，用户程序运行无需GPU支持。
 
 ```
 python gui.py
