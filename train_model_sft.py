@@ -2,10 +2,10 @@
 模型微调程序
 
 # 轻度微调（仅训练layer4和fc层）
-python finetune_model.py --data-dir ./data --epochs 30 --lr 0.0001 --fine-tune-level 1
+python train_model_sft.py --data-dir ./data --epochs 30 --lr 0.0001 --fine-tune-level 1
 
 # 深度微调（训练所有层）
-python finetune_model.py --data-dir ./data --epochs 50 --lr 0.00005 --fine-tune-level 4 --pretrained-model best_model.pth
+python train_model_sft.py --data-dir ./data --epochs 50 --lr 0.00005 --fine-tune-level 4 --pretrained-model best_model.pth
 '''
 import os
 import sys
@@ -334,4 +334,5 @@ def main():
     print(f"\nFine-tuning complete. Best validation accuracy: {best_acc:.4f}")
 
 if __name__ == '__main__':
+
     main()
