@@ -84,6 +84,10 @@ best_model.pth：汉字书法字体模型文件
 uvicorn main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-从而在浏览器中访问127.0.0.1:8000。用户也可以在公有云平台部署上述web服务，或者体验部署在HuggingFace的web服务 https://huggingface.co/spaces/xiajingfeng/shufa
+从而在浏览器中访问127.0.0.1:8000。用户也可以在公有云平台部署上述web服务，或者体验作者部署的测试用web服务：
+
+https://huggingface.co/spaces/xiajingfeng/shufa
+
+https://xjf123.dy.takin.cc
 
 ![screenshot](/assets/screenshot2.png)
