@@ -1,4 +1,4 @@
-name: HF Space Keep Alive
+name: HF Space KeepAlive
 on:
   workflow_dispatch:
   schedule:
@@ -12,45 +12,28 @@ jobs:
     timeout-minutes: 10
     env:
       SPACE_URL: "https://huggingface.co/spaces/xiajingfeng/shufa"
-      HTTP_PROXY: ""
-      HTTPS_PROXY: ""
     steps:
-      - name: Clear temp file
-        run: rm -f cookies.txt page.html
-      - name: Visit Space & Simulate user
+      - name: 安装依赖与浏览器
         run: |
-          MAX_RETRY=3
-          DELAY_STAY=15
-          for ((i=1; i<=MAX_RETRY; i++)); do
-            echo "===== Attempt $i ====="
-            curl -L \
-              --cookie-jar cookies.txt \
-              --cookie cookies.txt \
-              --connect-timeout 30 \
-              --max-time 90 \
-              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
-              -H "Accept-Language: zh-CN,zh;q=0.9" \
-              -H "Sec-Fetch-Mode: navigate" \
-              -H "Sec-Fetch-Site: none" \
-              -H "Sec-Fetch-Dest: document" \
-              $SPACE_URL > page.html
-
-            # 修复：只处理非空链接，curl失败不中断流程
-            grep -E '(src|href)="https://.*hf.space' page.html | awk -F'"' '{print $2}' | sort -u | while read -r link; do
-              if [[ -n "$link" ]]; then
-                curl -s --connect-timeout 10 --max-time 20 "$link" > /dev/null || true
-              fi
-            done
-
-            sleep $DELAY_STAY
-
-            if grep -q "application-container" page.html; then
-              echo "✅ Success: Space activated"
-              exit 0
-            fi
-            echo "❌ Not enter app page, retry after 30s"
-            sleep 30
-          done
-          echo "❌ All retry failed"
-          exit 1
+          sudo apt-get update
+          sudo apt-get install -y libglib2.0-0 libnss3 libnspr4 libatk1.0-0 libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 libpango-1.0-0 libcairo2 libatspi2.0-0 libwayland-client0
+          npm init -y
+          npm install playwright
+          npx playwright install chrome
+      - name: 浏览器访问保活
+        run: |
+          cat > keep.js << 'EOF'
+          const { chromium } = require('playwright');
+          (async () => {
+            const browser = await chromium.launch({ headless: true });
+            const page = await browser.newPage({
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0.0.0 Safari/537.36'
+            });
+            await page.goto(process.env.SPACE_URL, { timeout: 60000 });
+            // 页面停留20秒模拟真人浏览
+            await page.waitForTimeout(20000);
+            console.log("页面访问完成，保活成功");
+            await browser.close();
+          })();
+          EOF
+          node keep.js
