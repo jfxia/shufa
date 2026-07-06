@@ -1,35 +1,51 @@
-name: Keep HuggingFace Space Awake
-
+name: HF Space Keep Alive
 on:
-  # 每天早上9点（北京时间）执行
-  schedule:
-    - cron: '0 1 * * *'  # UTC 1:00 = 北京时间 9:00
-  # 也可以手动触发
   workflow_dispatch:
+  schedule:
+    - cron: "0 1 * * *"
+    - cron: "0 7 * * *"
+    - cron: "0 13 * * *"
 
 jobs:
-  keep-awake:
+  keepalive:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
-
+    timeout-minutes: 10
+    env:
+      SPACE_URL: "https://huggingface.co/spaces/xiajingfeng/shufa"
+      HTTP_PROXY: ""
+      HTTPS_PROXY: ""
     steps:
-      - name: Visit HuggingFace Space
+      - name: Clear temp file
+        run: rm -f cookies.txt page.html
+      - name: Visit Space & Simulate user
         run: |
-          # 模拟真实浏览器访问
-          curl -L -s -o /dev/null -w "%{http_code}" \
-            -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
-            -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
-            -H "Accept-Language: zh-CN,zh;q=0.9,en;q=0.8" \
-            -H "Accept-Encoding: gzip, deflate, br" \
-            -H "DNT: 1" \
-            -H "Connection: keep-alive" \
-            -H "Upgrade-Insecure-Requests: 1" \
-            -H "Sec-Fetch-Dest: document" \
-            -H "Sec-Fetch-Mode: navigate" \
-            -H "Sec-Fetch-Site: none" \
-            -H "Sec-Fetch-User: ?1" \
-            --connect-timeout 30 \
-            --max-time 60 \
-            "https://huggingface.co/spaces/xiajingfeng/shufa"
-          echo ""
-          echo "✓ 保活请求已发送"
+          MAX_RETRY=3
+          DELAY_STAY=15
+          for ((i=1; i<=MAX_RETRY; i++)); do
+            echo "===== Attempt $i ====="
+            curl -L \
+              --cookie-jar cookies.txt \
+              --cookie cookies.txt \
+              --connect-timeout 30 \
+              --max-time 90 \
+              -H "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36" \
+              -H "Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8" \
+              -H "Accept-Language: zh-CN,zh;q=0.9" \
+              -H "Sec-Fetch-Mode: navigate" \
+              -H "Sec-Fetch-Site: none" \
+              -H "Sec-Fetch-Dest: document" \
+              $SPACE_URL > page.html
+
+            # 加载页面静态资源
+            grep -E '(src|href)="https://.*hf.space' page.html | awk -F'"' '{print $2}' | xargs -I {} curl -s {} > /dev/null
+            sleep $DELAY_STAY
+
+            if grep -q "application-container" page.html; then
+              echo "✅ Success: Space activated"
+              exit 0
+            fi
+            echo "❌ Not enter app page, retry after 30s"
+            sleep 30
+          done
+          echo "❌ All retry failed"
+          exit 1
