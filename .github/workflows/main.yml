@@ -36,8 +36,13 @@ jobs:
               -H "Sec-Fetch-Dest: document" \
               $SPACE_URL > page.html
 
-            # 加载页面静态资源
-            grep -E '(src|href)="https://.*hf.space' page.html | awk -F'"' '{print $2}' | xargs -I {} curl -s {} > /dev/null
+            # 修复：只处理非空链接，curl失败不中断流程
+            grep -E '(src|href)="https://.*hf.space' page.html | awk -F'"' '{print $2}' | sort -u | while read -r link; do
+              if [[ -n "$link" ]]; then
+                curl -s --connect-timeout 10 --max-time 20 "$link" > /dev/null || true
+              fi
+            done
+
             sleep $DELAY_STAY
 
             if grep -q "application-container" page.html; then
